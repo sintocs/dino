@@ -1,0 +1,20 @@
+[project]
+name = "dino"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "sintocs", email = "moninroma2410@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.5",
+    "playwright>=1.65.2",
+]
+
+[project.scripts]
+dino = "dino:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
