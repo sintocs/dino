@@ -7,12 +7,14 @@ name = "dino"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "neat-python" },
     { name = "numpy" },
     { name = "playwright" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "neat-python", specifier = ">=2.0.0" },
     { name = "numpy", specifier = ">=2.5.5" },
     { name = "playwright", specifier = ">=1.65.2" },
 ]
@@ -62,6 +64,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/36/b35747582fa4f1a5453f8f3002405dbac788e450cec7674dc2d204b6ccb5/greenlet-3.5.6-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:de9923832f2d8c1a5ecd8d7260465a6ca5a86888a0d129e3bd5cf0406d2fc5bf", size = 1702383, upload-time = "2026-09-14T14:35:58.143Z" },
     { url = "https://files.pythonhosted.org/packages/ed/69/6ec22ac9351e474d2a134d0ff9400dc80362d1c20f0721088ffffdfc205b/greenlet-3.5.6-cp315-cp315t-win_amd64.whl", hash = "sha256:2ab5f42ac6c238eb71770715e6e909ad9a1a92b6c681ccb64cd5a0f07edb953f", size = 331845, upload-time = "2026-09-14T14:27:41.723Z" },
     { url = "https://files.pythonhosted.org/packages/30/cf/697c051fd534e223461fb8b523890e21a24eeca229cd50624cff6f02fabd/greenlet-3.5.6-cp315-cp315t-win_arm64.whl", hash = "sha256:f9fe868463ec7e1363733af77e38a5fda3e9b63940337048c945d69e0c80ff24", size = 315070, upload-time = "2026-09-14T14:22:21.476Z" },
+]
+
+[[package]]
+name = "neat-python"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/2d/6d3d96cde074bcbdc3fae08383bb6a9b2da2f98c405d16acceccc36c14c3/neat_python-2.0.0.tar.gz", hash = "sha256:fcfb5020aa3df5c12638865296589159939db08e9aa4191d9cf4e5b242a5d9cf", size = 126031, upload-time = "2026-03-02T17:13:16.587Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/a6/e85e39f593e3bd8ccc2dc57abf60c9a51fbc542616531629d988c05de484/neat_python-2.0.0-py3-none-any.whl", hash = "sha256:4ba18bec7b1d1dfa659348e28156f36007ebc111d46eb4ddc07a128377b459f7", size = 54056, upload-time = "2026-03-02T17:13:15.233Z" },
 ]
 
 [[package]]

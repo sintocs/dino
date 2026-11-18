@@ -5,10 +5,19 @@ build/
 dist/
 wheels/
 *.egg-info
-
-# Virtual environments
 .venv
 
-# Runtime artifacts
-q_table.npy
+# Runtime artifacts: NEAT
+best_genome.pkl
+best_network.json
 training_log.csv
+neat-checkpoint-*
+
+# Прочие артефакты прогонов
+fast_best.pkl
+fast_best.json
+fast_log.csv
+agent_extracted.js
+
+# Старое (Q-learning)
+q_table.npy
