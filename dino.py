@@ -638,6 +638,10 @@ class EpisodeResult:
 # после чего эволюция перестаёт искать настоящее поведение.
 USELESS_JUMP_PENALTY = 0.6
 
+# Бонус за дожитие до лимита эпизода. Чем меньше этот бонус относительно счёта,
+# тем сильнее сеть учится играть, а не просто выживать.
+SURVIVAL_BONUS = 250.0
+
 
 def make_result(data: dict[str, Any]) -> EpisodeResult:
     """Считает фитнес из сырых данных эпизода, полученных из страницы."""
@@ -650,11 +654,11 @@ def make_result(data: dict[str, Any]) -> EpisodeResult:
     ducks = int(data.get("ducks", 0) or 0)
 
     useful_share = 1.0 if jumps == 0 else max(0.0, 1.0 - useless / max(1, jumps))
-    fitness = float(score) * (0.3 + 0.7 * useful_share) + 0.02 * frames
+    fitness = float(score) * (0.4 + 0.6 * useful_share) + 0.02 * frames
     fitness -= USELESS_JUMP_PENALTY * useless
     if status in ("TIME", "FRAMES"):
-        # Дожил до лимита эпизода — это лучший возможный результат.
-        fitness += 500.0 + 0.5 * score
+        # Дожил до лимита эпизода — бонус за выживание, но не доминирующий.
+        fitness += SURVIVAL_BONUS + 0.25 * score
     elif status in ("NO_RUNNER", "STALL", "ERROR", "ABORT", "PY_TIMEOUT"):
         fitness = -100.0
 
@@ -691,12 +695,16 @@ class BrowserWorker:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.net: Optional[dict[str, Any]] = None
+        # Каждый воркер получает свой сид трассы — так разные браузеры показывают
+        # разные наборы препятствий, популяция обобщается лучше и не переобучается
+        # под единственную трассу поколения.
+        self.route_seed = getattr(args, "route_seed", None)
         self.agent_cfg = {
             "canvasWidth": CANVAS_W,
             "seconds": args.episode_seconds,
             "maxFrames": args.max_frames,
             "clearMs": args.clear_ms,
-            "seed": getattr(args, "route_seed", None) or 1,
+            "seed": self.route_seed if self.route_seed is not None else (1 + index),
         }
 
     async def start(self) -> None:
@@ -770,7 +778,9 @@ class BrowserWorker:
         self.net = network_to_js(genome, self.config)
         if getattr(self.args, "live", False):
             return await self._run_genome_live()
+
         hard_timeout = max(30.0, self.args.episode_seconds * 1.5 + 15.0)
+        total_timeout = hard_timeout + 20.0  # Additional buffer for browser overhead
 
         for attempt in range(1, 4):
             try:
@@ -782,12 +792,26 @@ class BrowserWorker:
                 )
                 snapshot = await asyncio.wait_for(
                     self.page.evaluate("() => window.__dino.simulate()"),
-                    timeout=hard_timeout,
+                    timeout=total_timeout,
                 )
                 if not snapshot.get("state") == "done":
                     await asyncio.sleep(0.3)
                     continue
                 return make_result(snapshot.get("result") or {})
+            except asyncio.TimeoutError:
+                last_error = "browser timeout"
+                # Браузер может быть зависший — перезапускаем его полностью
+                await self._force_restart()
+                await asyncio.sleep(0.5)
+                if attempt == 3:
+                    return EpisodeResult(
+                        fitness=-100.0,
+                        score=0,
+                        frames=0,
+                        seconds=0.0,
+                        status="PY_TIMEOUT",
+                        error=last_error,
+                    )
             except Exception as error:  # noqa: BLE001 — воркер не должен падать
                 last_error = str(error)
                 await asyncio.sleep(0.5)
@@ -802,6 +826,20 @@ class BrowserWorker:
                     )
 
         return EpisodeResult(-100.0, 0, 0, 0.0, "ERROR", "retries exhausted")
+
+    async def _force_restart(self) -> None:
+        """Полный перезапуск браузера после зависания."""
+        try:
+            if self.browser is not None:
+                await self.browser.close()
+        except Exception:  # noqa: BLE001
+            pass
+        await self.start()
+        if self.net is not None and self.page is not None:
+            await self.page.evaluate(
+                "(p) => window.__dino.init(p)",
+                {"net": self.net, "cfg": self.agent_cfg},
+            )
 
     async def _run_genome_live(self) -> EpisodeResult:
         """Живой режим (для --eval): игра идёт в реальном времени, с анимацией."""
@@ -876,9 +914,13 @@ class AsyncEvaluator:
         await asyncio.gather(*(worker.close() for worker in self.workers))
 
     def set_route_seed(self, seed: int) -> None:
-        """Один сид трассы на всё поколение — честное сравнение геномов."""
+        """Сиды трассы на поколение: базовый + индекс воркера.
+
+        Все браузеры поколения получают близкие, но разные сиды — так геномы
+        оцениваются на 다양ных трассах, не переобучаясь под одну.
+        """
         for worker in self.workers:
-            worker.agent_cfg["seed"] = seed
+            worker.agent_cfg["seed"] = seed + worker.index
 
     async def evaluate(self, genomes: list[tuple[int, neat.DefaultGenome]]) -> dict[int, EpisodeResult]:
         queue: asyncio.Queue[Optional[tuple[int, neat.DefaultGenome]]] = asyncio.Queue()
@@ -920,14 +962,27 @@ class AsyncEvaluator:
 # Журнал поколений
 # ---------------------------------------------------------------------------
 class TrainingLog:
-    HEADERS = ["generation", "best_fitness", "mean_fitness", "best_score", "seconds"]
+    HEADERS = [
+        "generation", "best_fitness", "mean_fitness", "best_score",
+        "min_score", "max_score", "mean_score", "errors", "workers", "seconds",
+    ]
 
     def __init__(self, path: str) -> None:
         self.path = path
-        is_new = not os.path.exists(path)
+        need_header = not os.path.exists(path)
+        if os.path.exists(path):
+            # Если в старом логе меньше колонок, чем сейчас — перезаписываем с новыми.
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    first_line = handle.readline()
+                existing = [h.strip() for h in first_line.split(",")]
+                if existing != self.HEADERS:
+                    need_header = True
+            except Exception:  # noqa: BLE001
+                need_header = True
         self._handle = open(path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._handle, fieldnames=self.HEADERS)
-        if is_new:
+        if need_header:
             self._writer.writeheader()
 
     def write(self, row: dict[str, Any]) -> None:
@@ -948,6 +1003,26 @@ def save_best(genome: neat.DefaultGenome, config: neat.Config, args: argparse.Na
     with open(args.network_file, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False)
     print(f"Лучший геном сохранён: {args.model_file} и {args.network_file}")
+
+
+def save_elite(
+    genomes: list[tuple[neat.DefaultGenome, EpisodeResult]],
+    config: neat.Config,
+    args: argparse.Namespace,
+    top_n: int = 5,
+) -> None:
+    """Сохраняет топ-N геномов в папку elite/ для отбора и анализа."""
+    elite_dir = os.path.join(os.path.dirname(args.model_file) or ".", "elite")
+    os.makedirs(elite_dir, exist_ok=True)
+    ranked = sorted(genomes, key=lambda item: item[1].fitness or -1e9, reverse=True)
+    for rank, (genome, result) in enumerate(ranked[:top_n], start=1):
+        prefix = f"elite-{rank:02d}_score{result.score}_fit{result.fitness:.0f}"
+        with open(os.path.join(elite_dir, prefix + ".pkl"), "wb") as handle:
+            pickle.dump(genome, handle)
+        payload = network_to_js(genome, config)
+        with open(os.path.join(elite_dir, prefix + ".json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    print(f"Элита ({min(top_n, len(ranked))} геномов) сохранена в {elite_dir}/")
 
 
 def load_genome(path: str) -> neat.DefaultGenome:
@@ -974,6 +1049,7 @@ async def train(args: argparse.Namespace, config: neat.Config) -> None:
     log = TrainingLog(args.log_file)
     best_ever: Optional[neat.DefaultGenome] = None
     best_score_ever = 0
+    generation_history: list[dict[str, Any]] = []
 
     # Не теряем более удачный геном из прошлых запусков.
     if os.path.exists(args.model_file):
@@ -989,6 +1065,11 @@ async def train(args: argparse.Namespace, config: neat.Config) -> None:
         f"Старт: браузеров={args.browsers}, поколений={args.generations}, "
         f"популяция={config.pop_size}, эпизод={args.episode_seconds} c"
     )
+    if args.curriculum:
+        print(
+            f"Curriculum включён: длина эпизода растёт от {args.episode_seconds} "
+            f"до {args.curriculum_max_seconds} с."
+        )
     if args.headless:
         print(
             "Окна браузеров скрыты (headless) — так обучение идёт быстрее. "
@@ -1004,9 +1085,18 @@ async def train(args: argparse.Namespace, config: neat.Config) -> None:
                     print(f"\n=== Поколение {generation} ===", flush=True)
                     population.reporters.start_generation(generation)
 
-                    # У всех геномов поколения — одна и та же трасса, но от
-                    # поколения к поколению она меняется, чтобы не переобучиться
-                    # под единственный набор препятствий.
+                    # --- Curriculum: постепенно усложняем окружение ---
+                    if args.curriculum:
+                        progress = min(1.0, generation / max(1, args.generations - 1))
+                        args.episode_seconds = args.episode_seconds + progress * (
+                            args.curriculum_max_seconds - args.episode_seconds
+                        )
+                        for worker in evaluator.workers:
+                            worker.agent_cfg["seconds"] = args.episode_seconds
+                        print(f"  длина эпизода: {args.episode_seconds:.1f} c", flush=True)
+
+                    # У всех геномов поколения — разные трассы (по одному сиду на воркер),
+                    # чтобы сеть обобщалась, не переобучаясь под одну карту.
                     if args.route_seed is None:
                         route_seed = random.randrange(1, 2**31 - 1)
                     else:
@@ -1020,6 +1110,13 @@ async def train(args: argparse.Namespace, config: neat.Config) -> None:
                     scored = [(population.population[gid], res) for gid, res in results.items()]
                     best_genome, best_result = max(scored, key=lambda item: item[0].fitness or -1e9)
                     mean_fitness = sum(g.fitness or 0.0 for g, _ in scored) / max(1, len(scored))
+                    scores = [res.score for _, res in scored]
+                    errors = sum(
+                        1
+                        for _, res in scored
+                        if res.status in ("ERROR", "NO_RUNNER", "STALL", "ABORT", "PY_TIMEOUT")
+                    )
+                    n_workers = len(evaluator.workers)
                     elapsed = time.monotonic() - started_at
 
                     # Сохраняем по реальному счёту: fitness с бонусом TIME может
@@ -1033,19 +1130,29 @@ async def train(args: argparse.Namespace, config: neat.Config) -> None:
                         best_score_ever = best_result.score
                         save_best(best_genome, config, args)
 
+                    # Элита топ-N каждые N поколений
+                    if args.elite_every > 0 and generation % args.elite_every == 0:
+                        save_elite(scored, config, args, top_n=5)
+
                     print(
                         f"  лучший score={best_result.score}, fitness={best_genome.fitness:.1f} "
-                        f"({best_result.status}), средний fitness={mean_fitness:.1f}, {elapsed:.1f} c"
+                        f"({best_result.status}), средний fitness={mean_fitness:.1f}, "
+                        f"ошибок={errors}, {elapsed:.1f} c"
                     )
-                    log.write(
-                        {
-                            "generation": generation,
-                            "best_fitness": round(best_genome.fitness or 0.0, 2),
-                            "mean_fitness": round(mean_fitness, 2),
-                            "best_score": best_result.score,
-                            "seconds": round(elapsed, 1),
-                        }
-                    )
+                    row = {
+                        "generation": generation,
+                        "best_fitness": round(best_genome.fitness or 0.0, 2),
+                        "mean_fitness": round(mean_fitness, 2),
+                        "best_score": best_result.score,
+                        "min_score": min(scores),
+                        "max_score": max(scores),
+                        "mean_score": round(sum(scores) / max(1, len(scores)), 2),
+                        "errors": errors,
+                        "workers": n_workers,
+                        "seconds": round(elapsed, 1),
+                    }
+                    log.write(row)
+                    generation_history.append(row)
 
                     population.reporters.post_evaluate(
                         config, population.population, population.species, best_genome
@@ -1073,6 +1180,121 @@ async def train(args: argparse.Namespace, config: neat.Config) -> None:
     print(f"\nОбучение завершено. Лучший счёт за всё время: {best_score_ever}")
     if best_ever is not None:
         save_best(best_ever, config, args)
+
+    # --- Дашборд ---
+    if args.dashboard and generation_history:
+        generate_dashboard(args.log_file, "training_dashboard.html")
+        print(f"Дашборд сохранён: training_dashboard.html")
+
+
+def generate_dashboard(log_path: str, output_path: str) -> None:
+    """Генерирует HTML-дашборд с графиками обучения из CSV-лога."""
+    try:
+        import csv
+
+        generations = []
+        best_fitness = []
+        mean_fitness = []
+        best_score = []
+        mean_score = []
+        errors = []
+
+        with open(log_path, newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                try:
+                    generations.append(int(row["generation"]))
+                    best_fitness.append(float(row["best_fitness"]))
+                    mean_fitness.append(float(row["mean_fitness"]))
+                    best_score.append(int(row["best_score"]))
+                    mean_score.append(float(row["mean_score"]))
+                    errors.append(int(row["errors"]))
+                except (ValueError, KeyError):
+                    continue
+
+        html = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Dino NEAT — Дашборд обучения</title>
+<style>
+  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem; background: #f5f5f5; }}
+  h1 {{ color: #333; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }}
+  .card {{ background: #fff; border-radius: 8px; padding: 1rem; box-shadow: 0 2px 6px rgba(0,0,0,.1); }}
+  canvas {{ width: 100%; height: 200px; }}
+  .stat {{ font-size: 1.25rem; font-weight: bold; color: #0066cc; }}
+  .muted {{ color: #666; font-size: 0.9rem; }}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<h1>🦖 Dino NEAT — Дашборд обучения</h1>
+<p class="muted">Источник: {log_path} | поколений: {len(generations)}</p>
+<div class="grid">
+  <div class="card">
+    <h3>Лучший фитнес</h3>
+    <canvas id="bestFit"></canvas>
+  </div>
+  <div class="card">
+    <h3>Средний фитнес</h3>
+    <canvas id="meanFit"></canvas>
+  </div>
+  <div class="card">
+    <h3>Лучший счёт</h3>
+    <canvas id="bestScore"></canvas>
+  </div>
+  <div class="card">
+    <h3>Средний счёт</h3>
+    <canvas id="meanScore"></canvas>
+  </div>
+  <div class="card">
+    <h3>Ошибок воркеров</h3>
+    <canvas id="errors"></canvas>
+  </div>
+</div>
+<script>
+const generations = {generations!r};
+const best_fitness = {best_fitness!r};
+const mean_fitness = {mean_fitness!r};
+const best_score = {best_score!r};
+const mean_score = {mean_score!r};
+const errors = {errors!r};
+
+const commonOpts = {{
+  responsive: true,
+  plugins: {{ legend: {{ display: false }} }},
+  scales: {{ y: {{ beginAtZero: true }}, x: {{ title: {{ display: true, text: 'Поколение' }} }} }},
+}};
+function chart(id, label, data, color) {{
+  new Chart(document.getElementById(id), {{
+    type: 'line',
+    data: {{
+      labels: generations,
+      datasets: [{{
+        label: label,
+        data: data,
+        borderColor: color,
+        backgroundColor: color + '22',
+        tension: 0.3,
+        fill: true,
+      }}],
+    }},
+    options: commonOpts,
+  }});
+}}
+chart('bestFit', 'Лучший фитнес', best_fitness, '#0066cc');
+chart('meanFit', 'Средний фитнес', mean_fitness, '#666666');
+chart('bestScore', 'Лучший счёт', best_score, '#00aa44');
+chart('meanScore', 'Средний счёт', mean_score, '#aa6600');
+chart('errors', 'Ошибок', errors, '#cc3333');
+</script>
+</body>
+</html>"""
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write(html)
+    except Exception as error:  # noqa: BLE001
+        print(f"Не удалось создать дашборд: {error}")
 
 
 # ---------------------------------------------------------------------------
@@ -1145,6 +1367,28 @@ def parse_args() -> argparse.Namespace:
         help="длительность показа в режиме --eval",
     )
     parser.add_argument("--eval", action="store_true", help="только играть сохранённым геномом")
+    parser.add_argument(
+        "--curriculum",
+        action="store_true",
+        help="постепенно увеличивать длину эпизода с поколения к поколению",
+    )
+    parser.add_argument(
+        "--curriculum-max-seconds",
+        type=float,
+        default=60.0,
+        help="максимальная длина эпизода в режиме curriculum",
+    )
+    parser.add_argument(
+        "--elite-every",
+        type=int,
+        default=10,
+        help="сохранять элиту топ-N геномов каждые N поколений (0 — отключить)",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="после обучения сгенерировать HTML-дашборд с графиками",
+    )
     args = parser.parse_args()
     args.headless = not args.headed
     return args
