@@ -13,11 +13,30 @@ best_network.json
 training_log.csv
 neat-checkpoint-*
 
-# Прочие артефакты прогонов
+# Экспериментальные модели и чекпоинты (в репозиторий идут только рабочие)
+best_genome_v2.pkl
+best_network_v2.json
+best_reflex_pilot.pkl
+best_reflex_pilot.json
+seed_test.*
+reflex-ck-*
+reflex-checkpoint-*
+seedtest-ck-*
+elite/
+
+# Логи прогонов и обучения
+*.log
+training_log_*.csv
+
+# Скриншоты и снимки диагностики
+*.png
+jump_profile.json
+
+# Быстрый агент (Q-learning) — не относится к NEAT-версии
 fast_best.pkl
 fast_best.json
 fast_log.csv
 agent_extracted.js
 
-# Старое (Q-learning)
+# Q-таблица (Q-learning)
 q_table.npy
